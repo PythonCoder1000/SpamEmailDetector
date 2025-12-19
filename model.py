@@ -1,11 +1,14 @@
+import json
+import os
 import random
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -15,11 +18,13 @@ from dataset import TextDataset
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    csv_path: str = "emails.csv"
+    datasets_directory: str = "datasets"
+    csv_file_name: str = "emails.csv"
     text_column_name: str = "text"
     label_column_name: str = "spam"
 
     test_fraction: float = 0.2
+    validation_fraction_of_remaining: float = 0.1
     random_seed: int = 42
 
     maximum_sequence_length: int = 160
@@ -27,7 +32,7 @@ class TrainingConfig:
     minimum_token_frequency: int = 2
 
     batch_size: int = 64
-    epoch_count: int = 6
+    epoch_count: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     gradient_clipping_norm: float = 1.0
@@ -39,6 +44,16 @@ class TrainingConfig:
     dropout_probability: float = 0.1
 
     data_loader_worker_count: int = 0
+
+    models_directory: str = "models"
+    saved_model_name: str = "spam_transformer_best.pt"
+    saved_vocabulary_name: str = "spam_transformer_vocab.json"
+    saved_config_name: str = "spam_transformer_config.json"
+
+    early_stopping_enabled: bool = True
+    early_stopping_metric: str = "spam_f1"
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 1e-4
 
 
 CONFIG = TrainingConfig()
@@ -146,7 +161,12 @@ class TransformerTextClassifier(nn.Module):
             batch_first=True,
             activation="gelu",
         )
-        self.transformer_encoder = nn.TransformerEncoder(transformer_encoder_layer, num_layers=encoder_layer_count, enable_nested_tensor=False)
+        self.transformer_encoder = nn.TransformerEncoder(
+            transformer_encoder_layer,
+            num_layers=encoder_layer_count,
+            enable_nested_tensor=False,
+        )
+
         self.dropout_layer = nn.Dropout(dropout_probability)
         self.classification_head = nn.Linear(model_dimension, class_count)
 
@@ -167,23 +187,16 @@ class TransformerTextClassifier(nn.Module):
         return logit_tensor
 
 
-@torch.no_grad()
-def compute_accuracy(model: nn.Module, data_loader: DataLoader) -> float:
-    model.eval()
-    correct_prediction_count = 0
-    total_sample_count = 0
-
-    for input_id_tensor, attention_mask_tensor, label_tensor in data_loader:
-        logit_tensor = model(input_id_tensor, attention_mask_tensor)
-        predicted_class_tensor = torch.argmax(logit_tensor, dim=1)
-        correct_prediction_count += (predicted_class_tensor == label_tensor).sum().item()
-        total_sample_count += label_tensor.numel()
-
-    return correct_prediction_count / max(1, total_sample_count)
+def resolve_dataset_path(datasets_directory: str, csv_file_name: str) -> str:
+    if os.path.isabs(csv_file_name):
+        return csv_file_name
+    return os.path.join(datasets_directory, csv_file_name)
 
 
-def load_and_split_dataframe(config: TrainingConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    full_dataframe = pd.read_csv(config.csv_path)
+def load_dataframe(config: TrainingConfig) -> pd.DataFrame:
+    dataset_path = resolve_dataset_path(config.datasets_directory, config.csv_file_name)
+    full_dataframe = pd.read_csv(dataset_path)
+
     if config.text_column_name not in full_dataframe.columns or config.label_column_name not in full_dataframe.columns:
         raise ValueError(
             f"CSV must contain columns {config.text_column_name!r} and {config.label_column_name!r}. Found: {list(full_dataframe.columns)}"
@@ -192,20 +205,67 @@ def load_and_split_dataframe(config: TrainingConfig) -> tuple[pd.DataFrame, pd.D
     working_dataframe = full_dataframe[[config.text_column_name, config.label_column_name]].copy()
     working_dataframe[config.text_column_name] = working_dataframe[config.text_column_name].astype(str)
     working_dataframe[config.label_column_name] = working_dataframe[config.label_column_name].astype(int)
+    working_dataframe = working_dataframe.rename(columns={config.text_column_name: "text", config.label_column_name: "spam"})
 
-    label_array = working_dataframe[config.label_column_name].values
-    training_dataframe, test_dataframe = train_test_split(
-        working_dataframe,
-        test_size=config.test_fraction,
-        random_state=config.random_seed,
-        stratify=label_array,
+    return working_dataframe
+
+
+def split_dataframe(
+    full_dataframe: pd.DataFrame,
+    test_fraction: float,
+    validation_fraction_of_remaining: float,
+    random_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    labels_full = full_dataframe["spam"].values
+    remaining_dataframe, test_dataframe = train_test_split(
+        full_dataframe,
+        test_size=test_fraction,
+        random_state=random_seed,
+        stratify=labels_full,
         shuffle=True,
     )
 
-    training_dataframe = training_dataframe.rename(columns={config.text_column_name: "text", config.label_column_name: "spam"})
-    test_dataframe = test_dataframe.rename(columns={config.text_column_name: "text", config.label_column_name: "spam"})
+    labels_remaining = remaining_dataframe["spam"].values
+    validation_dataframe, training_dataframe = train_test_split(
+        remaining_dataframe,
+        test_size=1.0 - validation_fraction_of_remaining,
+        random_state=random_seed,
+        stratify=labels_remaining,
+        shuffle=True,
+    )
 
-    return training_dataframe, test_dataframe
+    return training_dataframe, validation_dataframe, test_dataframe
+
+
+@torch.no_grad()
+def evaluate_model(model: nn.Module, data_loader: DataLoader) -> dict:
+    model.eval()
+    all_predictions = []
+    all_labels = []
+
+    for input_id_tensor, attention_mask_tensor, label_tensor in data_loader:
+        logit_tensor = model(input_id_tensor, attention_mask_tensor)
+        predicted_class_tensor = torch.argmax(logit_tensor, dim=1)
+        all_predictions.extend(predicted_class_tensor.detach().cpu().tolist())
+        all_labels.extend(label_tensor.detach().cpu().tolist())
+
+    accuracy_value = accuracy_score(all_labels, all_predictions)
+    precision_value, recall_value, f1_value, _ = precision_recall_fscore_support(
+        all_labels,
+        all_predictions,
+        average="binary",
+        pos_label=1,
+        zero_division=0,
+    )
+    confusion_matrix_values = confusion_matrix(all_labels, all_predictions).tolist()
+
+    return {
+        "accuracy": float(accuracy_value),
+        "spam_precision": float(precision_value),
+        "spam_recall": float(recall_value),
+        "spam_f1": float(f1_value),
+        "confusion_matrix": confusion_matrix_values,
+    }
 
 
 def train_one_epoch(
@@ -240,13 +300,48 @@ def train_one_epoch(
     return running_loss_sum / max(1, running_sample_count)
 
 
+def ensure_directory_exists(directory_path: str) -> None:
+    os.makedirs(directory_path, exist_ok=True)
+
+
+def save_artifacts(
+    model: nn.Module,
+    token_to_index: dict[str, int],
+    config: TrainingConfig,
+) -> None:
+    ensure_directory_exists(config.models_directory)
+
+    model_path = os.path.join(config.models_directory, config.saved_model_name)
+    vocabulary_path = os.path.join(config.models_directory, config.saved_vocabulary_name)
+    config_path = os.path.join(config.models_directory, config.saved_config_name)
+
+    torch.save(model.state_dict(), model_path)
+    with open(vocabulary_path, "w", encoding="utf-8") as file_handle:
+        json.dump(token_to_index, file_handle, ensure_ascii=False)
+    with open(config_path, "w", encoding="utf-8") as file_handle:
+        json.dump(asdict(config), file_handle, ensure_ascii=False)
+
+
+def get_metric_value(metrics: dict, metric_name: str) -> float:
+    if metric_name not in metrics:
+        raise ValueError(f"Unknown metric {metric_name!r}. Available: {sorted(metrics.keys())}")
+    return float(metrics[metric_name])
+
+
 def main() -> None:
     set_random_seed(CONFIG.random_seed)
     compute_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    training_dataframe, test_dataframe = load_and_split_dataframe(CONFIG)
+    full_dataframe = load_dataframe(CONFIG)
+    training_dataframe, validation_dataframe, test_dataframe = split_dataframe(
+        full_dataframe=full_dataframe,
+        test_fraction=CONFIG.test_fraction,
+        validation_fraction_of_remaining=CONFIG.validation_fraction_of_remaining,
+        random_seed=CONFIG.random_seed,
+    )
 
     training_dataset = TextDataset(training_dataframe)
+    validation_dataset = TextDataset(validation_dataframe)
     test_dataset = TextDataset(test_dataframe)
 
     training_texts = training_dataframe["text"].tolist()
@@ -283,6 +378,19 @@ def main() -> None:
         ),
     )
 
+    validation_data_loader = DataLoader(
+        validation_dataset,
+        batch_size=CONFIG.batch_size,
+        shuffle=False,
+        num_workers=CONFIG.data_loader_worker_count,
+        collate_fn=lambda batch_samples: collate_text_batch(
+            batch_samples=batch_samples,
+            token_to_index=token_to_index,
+            maximum_sequence_length=CONFIG.maximum_sequence_length,
+            compute_device=compute_device,
+        ),
+    )
+
     test_data_loader = DataLoader(
         test_dataset,
         batch_size=CONFIG.batch_size,
@@ -299,7 +407,8 @@ def main() -> None:
     loss_function = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG.learning_rate, weight_decay=CONFIG.weight_decay)
 
-    best_test_accuracy = 0.0
+    best_validation_metric_value = -1e30
+    epochs_without_improvement = 0
 
     for epoch_index in range(1, CONFIG.epoch_count + 1):
         average_training_loss = train_one_epoch(
@@ -309,12 +418,47 @@ def main() -> None:
             loss_function=loss_function,
             gradient_clipping_norm=CONFIG.gradient_clipping_norm,
         )
-        test_accuracy = compute_accuracy(model, test_data_loader)
-        best_test_accuracy = max(best_test_accuracy, test_accuracy)
-        print(f"epoch={epoch_index} training_loss={average_training_loss:.4f} test_accuracy={test_accuracy:.4f} best_test_accuracy={best_test_accuracy:.4f}")
 
-    final_test_accuracy = compute_accuracy(model, test_data_loader)
-    print(f"final_test_accuracy={final_test_accuracy:.4f}")
+        validation_metrics = evaluate_model(model, validation_data_loader)
+        validation_metric_value = get_metric_value(validation_metrics, CONFIG.early_stopping_metric)
+
+        improved = validation_metric_value > (best_validation_metric_value + CONFIG.early_stopping_min_delta)
+        if improved:
+            best_validation_metric_value = validation_metric_value
+            epochs_without_improvement = 0
+            save_artifacts(model=model, token_to_index=token_to_index, config=CONFIG)
+        else:
+            epochs_without_improvement += 1
+
+        print(
+            f"epoch={epoch_index} "
+            f"training_loss={average_training_loss:.4f} "
+            f"val_accuracy={validation_metrics['accuracy']:.4f} "
+            f"val_spam_precision={validation_metrics['spam_precision']:.4f} "
+            f"val_spam_recall={validation_metrics['spam_recall']:.4f} "
+            f"val_spam_f1={validation_metrics['spam_f1']:.4f} "
+            f"val_confusion_matrix={validation_metrics['confusion_matrix']} "
+            f"best_val_{CONFIG.early_stopping_metric}={best_validation_metric_value:.4f}"
+        )
+
+        if CONFIG.early_stopping_enabled and epochs_without_improvement >= CONFIG.early_stopping_patience:
+            print(
+                f"early_stopping_triggered=True "
+                f"epoch={epoch_index} "
+                f"patience={CONFIG.early_stopping_patience} "
+                f"metric={CONFIG.early_stopping_metric} "
+                f"best_metric={best_validation_metric_value:.4f}"
+            )
+            break
+
+    test_metrics = evaluate_model(model, test_data_loader)
+    print(
+        f"test_accuracy={test_metrics['accuracy']:.4f} "
+        f"test_spam_precision={test_metrics['spam_precision']:.4f} "
+        f"test_spam_recall={test_metrics['spam_recall']:.4f} "
+        f"test_spam_f1={test_metrics['spam_f1']:.4f} "
+        f"test_confusion_matrix={test_metrics['confusion_matrix']}"
+    )
 
 
 if __name__ == "__main__":
